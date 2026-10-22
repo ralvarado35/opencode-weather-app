@@ -1,0 +1,161 @@
+# Crea el tag v<versión> a partir de package.json y deja los binarios compilados
+# (Linux, macOS y Windows) como artifacts descargables de la ejecución.
+# Solo usa git y las herramientas ya incluidas en los runners: sin releases por
+# API, sin secrets propios y sin servicios externos.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - package.json
+  workflow_dispatch:
+
+# El token integrado de GitHub (lo usa actions/checkout) necesita poder empujar
+# el tag; no hay que configurar ningún secreto.
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Calcular versión
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      skip: ${{ steps.version.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+
+      - name: Leer package.json y comprobar el tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(bun -e 'console.log((await Bun.file("package.json").json()).version ?? "")')
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::package.json no tiene una versión semver válida (encontrado: '${version}')"
+            exit 1
+          fi
+          tag="v${version}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" > /dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "El tag \`${tag}\` ya existe: no hay nada que publicar." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Se publicará \`${tag}\` desde \`${GITHUB_SHA}\`." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  build:
+    name: Compilar (${{ matrix.name }})
+    needs: version
+    if: needs.version.outputs.skip == 'false'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x64
+            binary: weather-linux-x64
+          - os: macos-latest
+            name: darwin-arm64
+            binary: weather-darwin-arm64
+          - os: windows-latest
+            name: windows-x64
+            binary: weather-windows-x64.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+          cache: true
+
+      - name: Instalar dependencias
+        run: bun install --frozen-lockfile
+
+      # typecheck + tests + bun build --compile (aborta si algo falla)
+      - name: Compilar binario
+        run: bun run build
+
+      - name: Preparar artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f out/weather.exe ]; then
+            origen=out/weather.exe
+          else
+            origen=out/weather
+          fi
+          if [ ! -f "$origen" ]; then
+            echo "::error::No se generó el binario (${origen})"
+            exit 1
+          fi
+          mkdir -p dist
+          cp "$origen" "dist/${{ matrix.binary }}"
+          ls -l "dist/${{ matrix.binary }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.binary }}
+          path: dist/${{ matrix.binary }}
+          if-no-files-found: error
+          retention-days: 90
+
+  tag:
+    name: Crear tag ${{ needs.version.outputs.tag }}
+    needs: [version, build]
+    if: needs.version.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Crear y publicar el tag
+        shell: bash
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG" "$SHA"
+          git push origin "$TAG"
+
+      - name: Resumen
+        shell: bash
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Tag \`${TAG}\` publicado"
+            echo
+            echo "Commit: \`${GITHUB_SHA}\`"
+            echo
+            echo "Binarios de esta ejecución (artifacts, 90 días):"
+            echo
+            echo '| Plataforma | Artifact |'
+            echo '| --- | --- |'
+            echo '| Linux x64 | `weather-linux-x64` |'
+            echo '| macOS arm64 | `weather-darwin-arm64` |'
+            echo '| Windows x64 | `weather-windows-x64.exe` |'
+            echo
+            echo "Descarga: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } >> "$GITHUB_STEP_SUMMARY"
